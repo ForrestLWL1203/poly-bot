@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 
+import pytest
+
+import poly_bot.polymarket as polymarket
 from poly_bot.polymarket import Btc5mSeries, build_window, parse_book_side, parse_dt
 
 
@@ -40,3 +44,57 @@ def test_build_window_reads_token_ids_and_dates() -> None:
 
 def test_parse_dt_normalizes_timezone() -> None:
     assert parse_dt("2026-02-03T08:00:00+08:00") == dt.datetime(2026, 2, 3, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def test_price_stream_switch_tokens_reconnects_when_existing_ws_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ClosedWs:
+        async def send(self, _message: str) -> None:
+            raise RuntimeError("closed")
+
+        async def close(self) -> None:
+            return None
+
+    class FreshWs:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+
+        async def close(self) -> None:
+            return None
+
+        def __aiter__(self) -> "FreshWs":
+            return self
+
+        async def __anext__(self) -> str:
+            await asyncio.sleep(60)
+            return "{}"
+
+    fresh = FreshWs()
+
+    async def fake_connect(_url: str) -> FreshWs:
+        return fresh
+
+    async def noop(_update: polymarket.PriceUpdate) -> None:
+        return None
+
+    async def run() -> None:
+        stream = polymarket.PriceStream(noop)
+        stream._running = True
+        stream._ws = ClosedWs()
+        stream._connected_tokens = ["old-token"]
+        monkeypatch.setattr(polymarket.websockets, "connect", fake_connect)
+
+        await stream.switch_tokens(["new-token"])
+        await stream.close()
+
+    asyncio.run(run())
+
+    assert len(fresh.sent) == 1
+    assert json.loads(fresh.sent[0]) == {
+        "type": "market",
+        "assets_ids": ["new-token"],
+        "operation": "subscribe",
+        "custom_feature_enabled": True,
+    }

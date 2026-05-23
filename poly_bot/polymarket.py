@@ -162,11 +162,8 @@ class PriceStream:
         self._event_counts_since_read: Counter[str] = Counter()
 
     async def connect(self, token_ids: list[str]) -> None:
-        self._connected_tokens = list(token_ids)
         self._running = True
-        self._ws = await websockets.connect(CLOB_WS_URL)
-        await self._subscribe(token_ids)
-        self._recv_task = asyncio.create_task(self._recv_loop())
+        await self._reconnect(token_ids)
 
     async def switch_tokens(self, token_ids: list[str]) -> None:
         if not self._running:
@@ -176,11 +173,20 @@ class PriceStream:
         self._books.clear()
         self._prices.clear()
         if self._ws is None:
-            await self.connect(token_ids)
+            await self._reconnect(token_ids)
             return
         if old:
-            await self._ws.send(json.dumps({"assets_ids": old, "operation": "unsubscribe"}))
-        await self._subscribe(token_ids)
+            try:
+                await self._ws.send(json.dumps({"assets_ids": old, "operation": "unsubscribe"}))
+            except Exception as exc:
+                log.warning("CLOB unsubscribe failed, reconnecting: %s", exc)
+                await self._reconnect(token_ids)
+                return
+        try:
+            await self._subscribe(token_ids)
+        except Exception as exc:
+            log.warning("CLOB subscribe failed, reconnecting: %s", exc)
+            await self._reconnect(token_ids)
 
     async def close(self) -> None:
         self._running = False
@@ -223,6 +229,22 @@ class PriceStream:
     async def _subscribe(self, token_ids: list[str]) -> None:
         assert self._ws is not None
         await self._ws.send(json.dumps({"type": "market", "assets_ids": token_ids, "operation": "subscribe", "custom_feature_enabled": True}))
+
+    async def _reconnect(self, token_ids: list[str]) -> None:
+        if self._recv_task:
+            self._recv_task.cancel()
+            await asyncio.gather(self._recv_task, return_exceptions=True)
+            self._recv_task = None
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._connected_tokens = list(token_ids)
+        self._ws = await websockets.connect(CLOB_WS_URL)
+        await self._subscribe(token_ids)
+        self._recv_task = asyncio.create_task(self._recv_loop())
 
     def _fresh_book(self, token_id: str, max_age_sec: float | None) -> dict[str, Any] | None:
         book = self._books.get(token_id)
